@@ -35,7 +35,6 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
-#include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -44,11 +43,10 @@
 #include "esp_ota_ops.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
+#include "esp_eth.h"
+#include "driver/gpio.h"
 
 // --- Configuration ---
-// IMPORTANT: Replace with your network credentials
-#define WIFI_SSID      "YOUR_WIFI_SSID"
-#define WIFI_PASS      "YOUR_WIFI_PASSWORD"
 // IMPORTANT: Replace with your PC's IP address (from ipconfig)
 #define SERVER_IP      "YOUR_PC_IP_ADDRESS"
 #define SERVER_PORT    "5000"
@@ -61,89 +59,66 @@ static const char *TAG = "OTA_CLIENT";
 #define OTA_HTTP_BUFFER_SIZE 1024
 
 // Event group to signal when we are connected
-static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+static EventGroupHandle_t s_eth_event_group;
+#define ETH_CONNECTED_BIT BIT0
+#define ETH_FAIL_BIT      BIT1
 
-static int s_retry_num = 0;
-
-// --- Function Prototypes ---
-void ota_update_task(void *pvParameter);
-
-// --- Wi-Fi Event Handler ---
-static void event_handler(void* arg, esp_event_base_t event_base,
+// --- Ethernet Event Handler ---
+static void eth_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < 5) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG,"Connect to the AP fail");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    if (event_base == ETH_EVENT && event_id == ETHERNET_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "Ethernet Link Up");
+    } else if (event_base == ETH_EVENT && event_id == ETHERNET_EVENT_DISCONNECTED) {
+        ESP_LOGI(TAG, "Ethernet Link Down");
+    } else if (event_base == ETH_EVENT && event_id == ETHERNET_EVENT_START) {
+        ESP_LOGI(TAG, "Ethernet Started");
+    } else if (event_base == ETH_EVENT && event_id == ETHERNET_EVENT_STOP) {
+        ESP_LOGI(TAG, "Ethernet Stopped");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP address:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
     }
 }
 
-// --- Wi-Fi Initialization ---
-void wifi_init_sta(void) {
-    s_wifi_event_group = xEventGroupCreate();
+// --- Ethernet Initialization ---
+void eth_init(void) {
+    s_eth_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_eth_netif();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Configure Ethernet driver (use default config for LAN8720, adjust if needed)
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+    mac_config.smi_mdc_gpio_num = CONFIG_ETH_MDC_GPIO; // Set in menuconfig or replace with your GPIO
+    mac_config.smi_mdio_gpio_num = CONFIG_ETH_MDIO_GPIO; // Set in menuconfig or replace with your GPIO
 
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&mac_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan8720(&phy_config);
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+    ESP_ERROR_CHECK(esp_netif_attach(esp_netif_get_handle_from_ifkey("ETH_DEF"), eth_handle));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler, NULL));
 
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
-    // Wait until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-    // number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above)
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+    // Wait for IP
+    EventBits_t bits = xEventGroupWaitBits(s_eth_event_group,
+            ETH_CONNECTED_BIT,
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
 
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to AP SSID:%s", WIFI_SSID);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGW(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
+    if (bits & ETH_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Ethernet Connected");
     } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ESP_LOGE(TAG, "Ethernet Connection Failed");
     }
 }
 
@@ -288,6 +263,31 @@ void ota_update_task(void *pvParameter) {
             }
         } else {
             ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+        }
+
+        esp_http_client_cleanup(client);
+        ESP_LOGI(TAG, "Next check in %d seconds.", OTA_CHECK_INTERVAL_MS / 1000);
+        vTaskDelay(OTA_CHECK_INTERVAL_MS / portTICK_PERIOD_MS);
+    }
+}
+
+
+// --- Main Application Entry Point ---
+void app_main(void) {
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_LOGI(TAG, "ESP_ETH_MODE");
+    eth_init();
+
+    // Start the OTA update task
+    xTaskCreate(&ota_update_task, "ota_update_task", 8192, NULL, 5, NULL);
+}
         }
 
         esp_http_client_cleanup(client);
