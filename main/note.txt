@@ -1,0 +1,3 @@
+-this file sets your esp32 module's firmware to be update-able through your ethernet router based mac protocol. 
+-based on your very own router ethernet and your pc's mac address and ip address.
+-set your pc's ip and local ip as for your esp32's ip in order to make a different one in network so they do not cause trouble.
